@@ -502,3 +502,109 @@ sn.boxplot(x="N", y="correlation", hue="pipeline", data=dataframe, palette=cols,
 # sn.stripplot(x="N", y="correlation", hue="pipeline", data=dataframe)
 plt.ylabel("Correlation (OE)")
 plt.xlabel("Sample size $N$")
+
+
+
+def read_rating(fname, rater=None):
+    ds, sub = os.path.basename(os.path.splitext(fname)[0]).split('_')
+    data = {'dataset': ds, 'subject': sub}
+    if rater is not None:
+        data['rater'] = rater
+
+    with open(fname) as f:
+        ratings = json.load(f)
+
+    for reportlet in ratings['reports']:
+        name = reportlet['name']
+
+        if name == 'overall':
+            data[name] = int(reportlet['rating'])
+        elif '_T1w_' in name:
+            data['t1_%s' % name.split('_T1w_')[-1]] = int(reportlet['rating'])
+        elif '_bold_' in name:
+            repname = 'bold_%s' % name.split('_bold_')[-1]
+            data.setdefault(repname, []).append(int(reportlet['rating']))
+        elif '_fieldmap_':
+            repname = name.split('_fieldmap_')[-1]
+            data.setdefault(repname, []).append(int(reportlet['rating']))
+        else:
+            print('Unsupported field name "%s"' % name)
+
+    return data
+
+def read_dataset(data_dir, fields=['overall', 't1_reconall', 't1_seg_brainmask', 't1_t1_2_mni',
+                                   'bold_rois', 'bold_bbr', 'bold_syn_sdc']):
+    dataset = [read_rating(f, rater='rater_1') for f in data_dir.glob('rater_1/*.json')]
+    dataset += [read_rating(f, rater='rater_2') for f in data_dir.glob('rater_2/*.json')]
+    dataset += [read_rating(f, rater='rater_3') for f in data_dir.glob('rater_3/*.json')]
+
+    infields = list(set([a for g in dataset for a in g.keys()]))
+    infields.remove('dataset')
+    infields.remove('subject')
+    infields.remove('rater')
+    headers = ['dataset'] + infields
+
+    failed = []
+    unrated = []
+
+    # Average
+    dfs = []
+    for i, d in enumerate(dataset):
+        if 'bold_variant-hmcsdc_preproc' in d:
+            d['bold_rois'] = list(d['bold_rois']) + list(d['bold_variant-hmcsdc_preproc'])
+            del d['bold_variant-hmcsdc_preproc']
+        for k, v in d.items():
+            if k in ['dataset', 'subject', 'rater']:
+                continue
+
+            if isinstance(v, list):
+                filtered = [vv for vv in v if int(vv) > 0]
+                if filtered:
+                    d[k] = float(np.average(filtered))
+                else:
+                    d[k] = np.nan
+            else:
+                v = float(v) if int(v) > 0 else np.nan
+
+        dfs.append(pd.DataFrame(d, columns=headers, index=[i]))
+
+    # Merge raters
+    allraters = pd.concat(dfs).sort_values(by='dataset')
+    allraters[infields] = allraters[infields].clip(0.0)
+
+    averaged = []
+    for ds in set(allraters.dataset.ravel().tolist()):
+        d = {'dataset': ds.upper()}
+        group = allraters[allraters.dataset.str.contains(ds)]
+        groupavg = np.mean(group[headers[1:]].values, axis=0)
+        d.update({k: v for k, v in zip(headers[1:], groupavg)})
+        averaged.append(pd.DataFrame(d, columns=headers, index=pd.Index([d['dataset']])))
+    dataframe = pd.concat(averaged).sort_values(by='dataset')
+    dataframe.index.name = 'dataset'
+
+    dataframe['bold_bbr'] = dataframe[['bold_bbr', 'bold_coreg']].mean(axis=1)
+#     dataframe['bold_rois'] = dataframe[
+#         ['bold_rois'] + ['bold_variant-hmcsdc_preproc'] if 'bold_variant-hmcsdc_preproc' in headers else []].mean(axis=1)
+    # 'fmap_mask', 'bold_fmap_reg', 'bold_fmap_reg_vsm',
+    return dataframe[fields].sort_values(by=fields, ascending=False)
+
+
+# dataframe = pd.read_csv('fmriprep_qc.tsv', sep='\t')
+# dataframe0 = dataframe[dataframe.version.str.contains('1.0.0')]
+# dataframe = dataframe[dataframe.version.str.contains('1.0.7')]
+
+dataframe = read_dataset(Path.home().joinpath('tmp/fmriprep-reports-2'))
+dataframe0 = read_dataset(Path.home().joinpath('tmp/fmriprep-reports-1'))
+dataframe0 = dataframe0.reindex(dataframe.index)
+dataframe
+
+dataframe0['qc'] = [1] * len(dataframe0)
+dataframe['qc'] = [2] * len(dataframe)
+
+# dataframe0.to_csv('fmriprep_1.0.0.tsv', sep='\t', index=None)
+# dataframe.to_csv('fmriprep_1.0.7.tsv', sep='\t', index=None)
+
+new = dataframe0.append(dataframe)
+new['version'] = new.qc.map({1: '1.0.0', 2: '1.0.7'})
+new['dataset'] = new.index.values
+new[['dataset', 'version', 'overall', 't1_reconall', 't1_seg_brainmask', 't1_t1_2_mni', 'bold_rois', 'bold_bbr', 'bold_syn_sdc']].to_csv('fmriprep_qc.tsv', sep='\t', index=None)
